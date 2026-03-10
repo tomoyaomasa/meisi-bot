@@ -98,16 +98,19 @@ def extract_card_info(image_data: bytes) -> Optional[dict]:
 
     prompt = """この名刺画像から以下の情報を読み取り、JSON形式で返してください。
 読み取れない項目は空文字にしてください。
-手書きでA, B, Cのいずれかが書かれている場合は rank に記録してください。書かれていなければ空文字にしてください。
+電話番号が複数ある場合、代表電話と携帯電話を区別してください。
+住所から都道府県を分離してください。
 
 必ず以下のJSON形式のみで返してください。説明文は不要です。
 {
-  "company": "",
-  "name": "",
-  "title": "",
-  "tel": "",
-  "email": "",
-  "rank": ""
+  "company": "会社名",
+  "title": "役職",
+  "name": "顧客名",
+  "tel_main": "代表電話",
+  "tel_mobile": "携帯電話",
+  "email": "メールアドレス",
+  "prefecture": "都道府県",
+  "address": "住所"
 }"""
 
     try:
@@ -154,15 +157,16 @@ def append_to_sheet(display_name: str, card_info: dict) -> bool:
 
         now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
         row = [
-            now,                          # 受信日時
-            display_name,                 # 担当営業
-            card_info.get("rank", ""),     # ランク
-            card_info.get("company", ""),  # 会社名
-            card_info.get("name", ""),     # 氏名
-            card_info.get("title", ""),    # 役職
-            card_info.get("tel", ""),      # 電話番号
-            card_info.get("email", ""),    # メール
-            "",                           # 展示会名（空欄）
+            now,                               # 名刺取得日
+            display_name,                      # 営業担当
+            card_info.get("company", ""),       # 会社名
+            card_info.get("title", ""),         # 役職
+            card_info.get("name", ""),          # 顧客名
+            card_info.get("tel_main", ""),      # 代表電話
+            card_info.get("tel_mobile", ""),    # 携帯電話
+            card_info.get("email", ""),         # メールアドレス
+            card_info.get("prefecture", ""),    # 都道府県
+            card_info.get("address", ""),       # 住所
         ]
         sheet.append_row(row, value_input_option="USER_ENTERED")
         logger.info(f"スプレッドシート追記完了: {card_info.get('name', '不明')}")
@@ -234,11 +238,13 @@ def handle_image(event: MessageEvent):
             reply_text = (
                 f"名刺を登録しました\n"
                 f"会社名: {card_info.get('company', '')}\n"
-                f"氏名: {card_info.get('name', '')}\n"
                 f"役職: {card_info.get('title', '')}\n"
-                f"TEL: {card_info.get('tel', '')}\n"
+                f"顧客名: {card_info.get('name', '')}\n"
+                f"代表電話: {card_info.get('tel_main', '')}\n"
+                f"携帯電話: {card_info.get('tel_mobile', '')}\n"
                 f"Email: {card_info.get('email', '')}\n"
-                f"ランク: {card_info.get('rank', '') or 'なし'}"
+                f"都道府県: {card_info.get('prefecture', '')}\n"
+                f"住所: {card_info.get('address', '')}"
             )
         else:
             reply_text = "スプレッドシートへの書き込みに失敗しました。"
