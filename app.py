@@ -18,7 +18,7 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, ImageMessageContent
+from linebot.v3.webhooks import MessageEvent, ImageMessageContent, TextMessageContent
 from linebot.v3.exceptions import InvalidSignatureError
 import anthropic
 import gspread
@@ -227,6 +227,7 @@ def upsert_to_sheet(display_name: str, card_list: list) -> list:
             name = card_info.get("name", "")
 
             row = [
+                "",                                # 展示会名（空欄、後から一括設定）
                 now,                               # 名刺取得日
                 display_name,                      # 営業担当
                 company,                           # 会社名
@@ -240,20 +241,22 @@ def upsert_to_sheet(display_name: str, card_list: list) -> list:
                 card_info.get("rank", ""),          # ランク
             ]
 
-            # 重複チェック：会社名(列3)・顧客名(列5)・営業担当(列2)が一致する行を探す
+            # 重複チェック：会社名(列4)・顧客名(列6)・営業担当(列3)が一致する行を探す
             matched_row = None
             for idx, existing_row in enumerate(all_records):
-                if len(existing_row) >= 5:
-                    # 列: 0=名刺取得日, 1=営業担当, 2=会社名, 3=役職, 4=顧客名
-                    if (existing_row[2] == company and
-                            existing_row[4] == name and
-                            existing_row[1] == display_name):
+                if len(existing_row) >= 6:
+                    # 列: 0=展示会名, 1=名刺取得日, 2=営業担当, 3=会社名, 4=役職, 5=顧客名
+                    if (existing_row[3] == company and
+                            existing_row[5] == name and
+                            existing_row[2] == display_name):
                         matched_row = idx + 1  # gspreadは1始まり
                         break
 
             if matched_row:
-                # 上書き更新
-                sheet.update(f"A{matched_row}:K{matched_row}", [row])
+                # 上書き更新（展示会名は既存値を維持）
+                existing_exhibition = all_records[matched_row - 1][0] if len(all_records[matched_row - 1]) > 0 else ""
+                row[0] = existing_exhibition
+                sheet.update(f"A{matched_row}:L{matched_row}", [row])
                 logger.info(f"スプレッドシート上書き完了: {name}")
                 results.append("updated")
             else:
@@ -268,6 +271,29 @@ def upsert_to_sheet(display_name: str, card_list: list) -> list:
     except Exception as e:
         logger.error(f"スプレッドシート書き込みエラー: {e}")
         return []
+
+
+def update_exhibition_name(exhibition_name: str) -> int:
+    """今日の日付の行の展示会名を一括更新する。更新件数を返す。"""
+    try:
+        gc = get_gspread_client()
+        sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
+        all_records = sheet.get_all_values()
+        today = datetime.now().strftime("%Y/%m/%d")
+        count = 0
+
+        for idx, row in enumerate(all_records):
+            if len(row) >= 2:
+                # 列1（B列）= 名刺取得日。日付部分のみ比較
+                cell_date = row[1].split(" ")[0] if row[1] else ""
+                if cell_date == today:
+                    sheet.update_cell(idx + 1, 1, exhibition_name)  # A列を更新
+                    count += 1
+
+        return count
+    except Exception as e:
+        logger.error(f"展示会名更新エラー: {e}")
+        return 0
 
 
 # ========================================
@@ -366,6 +392,7 @@ def handle_image(event: MessageEvent):
                     warnings.append(f"⚠️ {prefix}電話番号が読み取れませんでした")
             if warnings:
                 reply_text += "\n\n" + "\n".join(warnings)
+            reply_text += "\n\n📌 展示会名を登録する場合は\n『展示会：〇〇〇〇』と送信してください"
         else:
             reply_text = "スプレッドシートへの書き込みに失敗しました。"
 
@@ -391,6 +418,40 @@ def handle_image(event: MessageEvent):
                 )
         except Exception:
             logger.error("エラー返信にも失敗しました")
+
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_text(event: MessageEvent):
+    """テキストメッセージ処理（展示会名の一括設定）"""
+    text = event.message.text.strip()
+
+    # 「展示会：〇〇」または「展示会名：〇〇」のパターンを検出
+    match = re.match(r'^展示会名?[：:](.+)$', text)
+    if not match:
+        return  # 展示会コマンド以外は無視
+
+    exhibition_name = match.group(1).strip()
+    if not exhibition_name:
+        return
+
+    try:
+        count = update_exhibition_name(exhibition_name)
+        reply_text = (
+            f"✅ 展示会名を更新しました\n"
+            f"展示会名：{exhibition_name}\n"
+            f"更新件数：{count}件"
+        )
+
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)],
+                )
+            )
+    except Exception as e:
+        logger.error(f"展示会名更新処理エラー: {e}")
 
 
 # ========================================
