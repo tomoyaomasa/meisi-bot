@@ -14,6 +14,7 @@ from linebot.v3.messaging import (
     Configuration,
     ApiClient,
     MessagingApi,
+    MessagingApiBlob,
     ReplyMessageRequest,
     TextMessage,
 )
@@ -87,8 +88,8 @@ def get_display_name(user_id: str, group_id: Optional[str] = None) -> str:
 def get_image_from_line(message_id: str) -> bytes:
     """LINE から画像バイナリを取得する"""
     with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        content = line_bot_api.get_message_content(message_id)
+        blob_api = MessagingApiBlob(api_client)
+        content = blob_api.get_message_content(message_id)
         return content
 
 
