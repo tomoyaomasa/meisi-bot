@@ -210,21 +210,28 @@ def extract_card_info(image_data: bytes) -> Optional[list]:
         return None
 
 
-def append_to_sheet(display_name: str, card_list: list) -> int:
-    """Googleスプレッドシートにデータを追記する（複数枚対応）。追記した件数を返す。"""
+def upsert_to_sheet(display_name: str, card_list: list) -> list:
+    """Googleスプレッドシートにデータを追記または上書きする（複数枚対応）。
+    各名刺について 'new' または 'updated' のステータスをリストで返す。"""
     try:
         gc = get_gspread_client()
         sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
         now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-        count = 0
+
+        # 既存データを全件取得（ヘッダー含む）
+        all_records = sheet.get_all_values()
+        results = []
 
         for card_info in card_list:
+            company = card_info.get("company", "")
+            name = card_info.get("name", "")
+
             row = [
                 now,                               # 名刺取得日
                 display_name,                      # 営業担当
-                card_info.get("company", ""),       # 会社名
+                company,                           # 会社名
                 card_info.get("title", ""),         # 役職
-                card_info.get("name", ""),          # 顧客名
+                name,                              # 顧客名
                 card_info.get("tel_main", ""),      # 代表電話
                 card_info.get("tel_mobile", ""),    # 携帯電話
                 card_info.get("email", ""),         # メールアドレス
@@ -232,14 +239,35 @@ def append_to_sheet(display_name: str, card_list: list) -> int:
                 card_info.get("address", ""),       # 住所
                 card_info.get("rank", ""),          # ランク
             ]
-            sheet.append_row(row, value_input_option="USER_ENTERED")
-            logger.info(f"スプレッドシート追記完了: {card_info.get('name', '不明')}")
-            count += 1
 
-        return count
+            # 重複チェック：会社名(列3)・顧客名(列5)・営業担当(列2)が一致する行を探す
+            matched_row = None
+            for idx, existing_row in enumerate(all_records):
+                if len(existing_row) >= 5:
+                    # 列: 0=名刺取得日, 1=営業担当, 2=会社名, 3=役職, 4=顧客名
+                    if (existing_row[2] == company and
+                            existing_row[4] == name and
+                            existing_row[1] == display_name):
+                        matched_row = idx + 1  # gspreadは1始まり
+                        break
+
+            if matched_row:
+                # 上書き更新
+                sheet.update(f"A{matched_row}:K{matched_row}", [row])
+                logger.info(f"スプレッドシート上書き完了: {name}")
+                results.append("updated")
+            else:
+                # 新規追加
+                sheet.append_row(row, value_input_option="USER_ENTERED")
+                # 追加した行を既存データにも反映（後続の重複チェック用）
+                all_records.append(row)
+                logger.info(f"スプレッドシート新規追加完了: {name}")
+                results.append("new")
+
+        return results
     except Exception as e:
         logger.error(f"スプレッドシート書き込みエラー: {e}")
-        return 0
+        return []
 
 
 # ========================================
@@ -297,15 +325,27 @@ def handle_image(event: MessageEvent):
                 )
             return
 
-        # スプレッドシートに追記
-        count = append_to_sheet(display_name, card_list)
+        # スプレッドシートに追記/上書き
+        results = upsert_to_sheet(display_name, card_list)
 
-        if count > 0:
-            reply_text = f"✅ 登録完了（{count}件）\n"
+        if results:
+            new_count = results.count("new")
+            updated_count = results.count("updated")
+            total_count = len(results)
+
+            # ヘッダー
+            header_parts = []
+            if new_count > 0:
+                header_parts.append(f"✅ 新規登録完了（{new_count}件）")
+            if updated_count > 0:
+                header_parts.append(f"🔄 既存データを更新しました（{updated_count}件）")
+            reply_text = "\n".join(header_parts) + "\n"
+
             warnings = []
-            for i, card_info in enumerate(card_list[:count], 1):
+            for i, (card_info, status) in enumerate(zip(card_list[:total_count], results), 1):
+                status_icon = "✅" if status == "new" else "🔄"
                 reply_text += (
-                    f"\n【{i}件目】\n"
+                    f"\n【{i}件目】{status_icon}\n"
                     f"会社名：{card_info.get('company', '')}\n"
                     f"役職：{card_info.get('title', '')}\n"
                     f"顧客名：{card_info.get('name', '')}\n"
@@ -317,7 +357,7 @@ def handle_image(event: MessageEvent):
                     f"ランク：{card_info.get('rank', '') or 'なし'}"
                 )
                 # 警告チェック
-                prefix = f"【{i}件目】" if count > 1 else ""
+                prefix = f"【{i}件目】" if total_count > 1 else ""
                 if not card_info.get("company"):
                     warnings.append(f"⚠️ {prefix}会社名が読み取れませんでした")
                 if not card_info.get("name"):
