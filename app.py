@@ -93,31 +93,36 @@ def get_image_from_line(message_id: str) -> bytes:
         return content
 
 
-def extract_card_info(image_data: bytes) -> Optional[dict]:
-    """Claude Vision APIで名刺画像から情報を抽出する"""
+def extract_card_info(image_data: bytes) -> Optional[list]:
+    """Claude Vision APIで名刺画像から情報を抽出する（複数枚対応）"""
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
-    prompt = """この名刺画像から以下の情報を読み取り、JSON形式で返してください。
+    prompt = """この画像に写っている全ての名刺から以下の情報を読み取り、JSON配列で返してください。
+名刺が1枚でも配列で返してください。
 読み取れない項目は空文字にしてください。
 電話番号が複数ある場合、代表電話と携帯電話を区別してください。
 住所から都道府県を分離してください。
+手書きでA, B, Cのいずれかが書かれている場合は rank に記録してください。書かれていなければ空文字にしてください。
 
-必ず以下のJSON形式のみで返してください。説明文は不要です。
-{
-  "company": "会社名",
-  "title": "役職",
-  "name": "顧客名",
-  "tel_main": "代表電話",
-  "tel_mobile": "携帯電話",
-  "email": "メールアドレス",
-  "prefecture": "都道府県",
-  "address": "住所"
-}"""
+必ず以下のJSON配列形式のみで返してください。説明文は不要です。
+[
+  {
+    "company": "会社名",
+    "title": "役職",
+    "name": "顧客名",
+    "tel_main": "代表電話",
+    "tel_mobile": "携帯電話",
+    "email": "メールアドレス",
+    "prefecture": "都道府県",
+    "address": "住所",
+    "rank": "手書きのABC"
+  }
+]"""
 
     try:
         response = claude_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1024,
+            max_tokens=4096,
             messages=[
                 {
                     "role": "user",
@@ -140,41 +145,50 @@ def extract_card_info(image_data: bytes) -> Optional[dict]:
         )
 
         result_text = response.content[0].text.strip()
-        # JSON部分を抽出（コードブロックで囲まれている場合も対応）
-        json_match = re.search(r'\{[^{}]*\}', result_text, re.DOTALL)
+        # JSON配列を抽出（コードブロックで囲まれている場合も対応）
+        json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
         if json_match:
-            return json.loads(json_match.group())
-        return json.loads(result_text)
+            result = json.loads(json_match.group())
+        else:
+            result = json.loads(result_text)
+        # 単一オブジェクトが返された場合も配列に変換
+        if isinstance(result, dict):
+            result = [result]
+        return result
     except Exception as e:
         logger.error(f"Claude API エラー: {e}")
         return None
 
 
-def append_to_sheet(display_name: str, card_info: dict) -> bool:
-    """Googleスプレッドシートにデータを追記する"""
+def append_to_sheet(display_name: str, card_list: list) -> int:
+    """Googleスプレッドシートにデータを追記する（複数枚対応）。追記した件数を返す。"""
     try:
         gc = get_gspread_client()
         sheet = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
-
         now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-        row = [
-            now,                               # 名刺取得日
-            display_name,                      # 営業担当
-            card_info.get("company", ""),       # 会社名
-            card_info.get("title", ""),         # 役職
-            card_info.get("name", ""),          # 顧客名
-            card_info.get("tel_main", ""),      # 代表電話
-            card_info.get("tel_mobile", ""),    # 携帯電話
-            card_info.get("email", ""),         # メールアドレス
-            card_info.get("prefecture", ""),    # 都道府県
-            card_info.get("address", ""),       # 住所
-        ]
-        sheet.append_row(row, value_input_option="USER_ENTERED")
-        logger.info(f"スプレッドシート追記完了: {card_info.get('name', '不明')}")
-        return True
+        count = 0
+
+        for card_info in card_list:
+            row = [
+                now,                               # 名刺取得日
+                display_name,                      # 営業担当
+                card_info.get("company", ""),       # 会社名
+                card_info.get("title", ""),         # 役職
+                card_info.get("name", ""),          # 顧客名
+                card_info.get("tel_main", ""),      # 代表電話
+                card_info.get("tel_mobile", ""),    # 携帯電話
+                card_info.get("email", ""),         # メールアドレス
+                card_info.get("prefecture", ""),    # 都道府県
+                card_info.get("address", ""),       # 住所
+            ]
+            sheet.append_row(row, value_input_option="USER_ENTERED")
+            logger.info(f"スプレッドシート追記完了: {card_info.get('name', '不明')}")
+            count += 1
+
+        return count
     except Exception as e:
         logger.error(f"スプレッドシート書き込みエラー: {e}")
-        return False
+        return 0
 
 
 # ========================================
@@ -219,8 +233,8 @@ def handle_image(event: MessageEvent):
         image_data = get_image_from_line(event.message.id)
 
         # Claude Vision で名刺情報抽出
-        card_info = extract_card_info(image_data)
-        if not card_info:
+        card_list = extract_card_info(image_data)
+        if not card_list:
             reply_text = "名刺の読み取りに失敗しました。もう一度お試しください。"
             with ApiClient(configuration) as api_client:
                 line_bot_api = MessagingApi(api_client)
@@ -233,20 +247,17 @@ def handle_image(event: MessageEvent):
             return
 
         # スプレッドシートに追記
-        success = append_to_sheet(display_name, card_info)
+        count = append_to_sheet(display_name, card_list)
 
-        if success:
-            reply_text = (
-                f"名刺を登録しました\n"
-                f"会社名: {card_info.get('company', '')}\n"
-                f"役職: {card_info.get('title', '')}\n"
-                f"顧客名: {card_info.get('name', '')}\n"
-                f"代表電話: {card_info.get('tel_main', '')}\n"
-                f"携帯電話: {card_info.get('tel_mobile', '')}\n"
-                f"Email: {card_info.get('email', '')}\n"
-                f"都道府県: {card_info.get('prefecture', '')}\n"
-                f"住所: {card_info.get('address', '')}"
-            )
+        if count > 0:
+            reply_text = f"{count}件の名刺を登録しました\n"
+            for i, card_info in enumerate(card_list[:count], 1):
+                reply_text += (
+                    f"\n【{i}件目】\n"
+                    f"会社名: {card_info.get('company', '')}\n"
+                    f"顧客名: {card_info.get('name', '')}\n"
+                    f"役職: {card_info.get('title', '')}"
+                )
         else:
             reply_text = "スプレッドシートへの書き込みに失敗しました。"
 
