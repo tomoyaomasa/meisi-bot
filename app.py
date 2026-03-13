@@ -93,16 +93,52 @@ def get_image_from_line(message_id: str) -> bytes:
         return content
 
 
+PREFECTURES = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+]
+
+
+def extract_prefecture(address: str) -> str:
+    """住所文字列から都道府県を抽出する"""
+    for pref in PREFECTURES:
+        if address.startswith(pref):
+            return pref
+    return ""
+
+
+def postprocess_card(card_info: dict) -> dict:
+    """都道府県の自動補完を行う"""
+    prefecture = card_info.get("prefecture", "")
+    address = card_info.get("address", "")
+    if not prefecture and address:
+        prefecture = extract_prefecture(address)
+        card_info["prefecture"] = prefecture
+    # 住所に都道府県が含まれている場合、addressから除去
+    if prefecture and address.startswith(prefecture):
+        card_info["address"] = address[len(prefecture):]
+    return card_info
+
+
 def extract_card_info(image_data: bytes) -> Optional[list]:
     """Claude Vision APIで名刺画像から情報を抽出する（複数枚対応）"""
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
-    prompt = """この画像に写っている全ての名刺から以下の情報を読み取り、JSON配列で返してください。
-名刺が1枚でも配列で返してください。
-読み取れない項目は空文字にしてください。
-電話番号が複数ある場合、代表電話と携帯電話を区別してください。
-住所から都道府県を分離してください。
-手書きでA, B, Cのいずれかが書かれている場合は rank に記録してください。書かれていなければ空文字にしてください。
+    prompt = """この画像に写っている「全ての名刺」を1枚ずつ読み取り、JSON配列で返してください。
+名刺が1枚でも必ず配列で返してください。
+
+【読み取りルール】
+- 読み取れない項目は空文字にする
+- 電話番号が複数ある場合、代表電話（固定電話）と携帯電話を区別する
+- 住所が複数ある場合、「本社」と記載されている住所を優先する。本社の記載がない場合は最初の住所を使用する
+- 都道府県は住所から必ず単独で抽出し、prefectureに入れる（例：東京都、大阪府、北海道など）
+- addressには都道府県を除いた残りの住所を入れる
+- 画像内に手書きの文字（A・B・Cのいずれか）があれば必ず読み取り、rankに記録する。なければ空文字にする
 
 必ず以下のJSON配列形式のみで返してください。説明文は不要です。
 [
@@ -114,7 +150,7 @@ def extract_card_info(image_data: bytes) -> Optional[list]:
     "tel_mobile": "携帯電話",
     "email": "メールアドレス",
     "prefecture": "都道府県",
-    "address": "住所",
+    "address": "住所（都道府県を除く）",
     "rank": "手書きのABC"
   }
 ]"""
@@ -154,6 +190,8 @@ def extract_card_info(image_data: bytes) -> Optional[list]:
         # 単一オブジェクトが返された場合も配列に変換
         if isinstance(result, dict):
             result = [result]
+        # 都道府県の自動補完
+        result = [postprocess_card(card) for card in result]
         return result
     except Exception as e:
         logger.error(f"Claude API エラー: {e}")
@@ -180,6 +218,7 @@ def append_to_sheet(display_name: str, card_list: list) -> int:
                 card_info.get("email", ""),         # メールアドレス
                 card_info.get("prefecture", ""),    # 都道府県
                 card_info.get("address", ""),       # 住所
+                card_info.get("rank", ""),          # ランク
             ]
             sheet.append_row(row, value_input_option="USER_ENTERED")
             logger.info(f"スプレッドシート追記完了: {card_info.get('name', '不明')}")
@@ -250,14 +289,31 @@ def handle_image(event: MessageEvent):
         count = append_to_sheet(display_name, card_list)
 
         if count > 0:
-            reply_text = f"{count}件の名刺を登録しました\n"
+            reply_text = f"✅ 登録完了（{count}件）\n"
+            warnings = []
             for i, card_info in enumerate(card_list[:count], 1):
                 reply_text += (
                     f"\n【{i}件目】\n"
-                    f"会社名: {card_info.get('company', '')}\n"
-                    f"顧客名: {card_info.get('name', '')}\n"
-                    f"役職: {card_info.get('title', '')}"
+                    f"会社名：{card_info.get('company', '')}\n"
+                    f"役職：{card_info.get('title', '')}\n"
+                    f"顧客名：{card_info.get('name', '')}\n"
+                    f"代表電話：{card_info.get('tel_main', '')}\n"
+                    f"携帯電話：{card_info.get('tel_mobile', '')}\n"
+                    f"メール：{card_info.get('email', '')}\n"
+                    f"都道府県：{card_info.get('prefecture', '')}\n"
+                    f"住所：{card_info.get('address', '')}\n"
+                    f"ランク：{card_info.get('rank', '') or 'なし'}"
                 )
+                # 警告チェック
+                prefix = f"【{i}件目】" if count > 1 else ""
+                if not card_info.get("company"):
+                    warnings.append(f"⚠️ {prefix}会社名が読み取れませんでした")
+                if not card_info.get("name"):
+                    warnings.append(f"⚠️ {prefix}顧客名が読み取れませんでした")
+                if not card_info.get("tel_main") and not card_info.get("tel_mobile"):
+                    warnings.append(f"⚠️ {prefix}電話番号が読み取れませんでした")
+            if warnings:
+                reply_text += "\n\n" + "\n".join(warnings)
         else:
             reply_text = "スプレッドシートへの書き込みに失敗しました。"
 
