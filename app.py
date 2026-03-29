@@ -217,25 +217,28 @@ def extract_card_info(image_data: bytes) -> Optional[list]:
         return None
 
 
-def extract_receipt_info(image_data: bytes) -> Optional[dict]:
-    """Claude Vision APIでレシート画像から情報を抽出する"""
+def extract_receipt_info(image_data: bytes) -> Optional[list]:
+    """Claude Vision APIでレシート画像から情報を抽出する（複数枚対応）"""
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
-    prompt = """このレシート画像から情報を読み取り、以下のJSONのみを返してください。説明文は不要です。
-{
-  "date": "日付(YYYY/MM/DD形式)",
-  "store": "支払先名",
-  "amount": "税込金額(数値のみ)",
-  "tax_rate": "消費税率(8 or 10の数値のみ)",
-  "payment": "支払方法(現金/クレジット/ICカード のいずれか)",
-  "card_name": "カード会社名(クレジットの場合のみ、不明なら空)",
-  "category": "勘定科目(旅費交通費/会議費/消耗品費/車両費/通信費/接待交際費 のいずれかを推定)"
-}"""
+    prompt = """この画像に写っているレシートを全て読み取り、以下のJSON配列形式のみで返してください。
+レシートが1枚の場合も必ず配列で返すこと。説明文は不要です。
+[
+  {
+    "date": "日付(YYYY/MM/DD形式)",
+    "store": "支払先名",
+    "amount": "税込金額(数値のみ)",
+    "tax_rate": "消費税率(8 or 10の数値のみ)",
+    "payment": "支払方法(現金/クレジット/ICカード のいずれか)",
+    "card_name": "カード会社名(クレジットの場合のみ、不明なら空文字)",
+    "category": "勘定科目(旅費交通費/会議費/消耗品費/車両費/通信費/接待交際費 のいずれかを推定)"
+  }
+]"""
 
     try:
         response = claude_client.messages.create(
             model="claude-sonnet-4-20250514",
-            max_tokens=1024,
+            max_tokens=2048,
             messages=[
                 {
                     "role": "user",
@@ -258,17 +261,22 @@ def extract_receipt_info(image_data: bytes) -> Optional[dict]:
         )
 
         result_text = response.content[0].text.strip()
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
         if json_match:
-            return json.loads(json_match.group())
-        return json.loads(result_text)
+            result = json.loads(json_match.group())
+        else:
+            result = json.loads(result_text)
+        # 単一オブジェクトが返された場合も配列に変換
+        if isinstance(result, dict):
+            result = [result]
+        return result
     except Exception as e:
         logger.error(f"Claude API エラー（レシート）: {e}")
         return None
 
 
-def write_receipt_to_sheet(receipt_info: dict) -> bool:
-    """レシート情報をMF仕訳シートに書き込む"""
+def write_receipts_to_sheet(receipt_list: list) -> bool:
+    """レシート情報をMF仕訳シートに書き込む（複数件対応）"""
     try:
         gc = get_gspread_client()
         spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
@@ -286,58 +294,61 @@ def write_receipt_to_sheet(receipt_info: dict) -> bool:
             ]
             ws.append_row(headers, value_input_option="USER_ENTERED")
 
-        # 取引No自動採番
+        # 取引No自動採番（現在の行数から開始）
         all_values = ws.get_all_values()
-        transaction_no = len(all_values)  # ヘッダー行を含む行数 = 次の取引No
+        transaction_no = len(all_values)
 
-        date = receipt_info.get("date", "")
-        category = receipt_info.get("category", "")
-        tax_rate = str(receipt_info.get("tax_rate", "10"))
-        amount = str(receipt_info.get("amount", "0"))
-        payment = receipt_info.get("payment", "")
-        store = receipt_info.get("store", "")
-        card_name = receipt_info.get("card_name", "")
+        for receipt_info in receipt_list:
+            date = receipt_info.get("date", "")
+            category = receipt_info.get("category", "")
+            tax_rate = str(receipt_info.get("tax_rate", "10"))
+            amount = str(receipt_info.get("amount", "0"))
+            payment = receipt_info.get("payment", "")
+            store = receipt_info.get("store", "")
+            card_name = receipt_info.get("card_name", "")
 
-        # 借方税区分
-        if tax_rate == "8":
-            debit_tax_class = "課税仕入 8%"
-        else:
-            debit_tax_class = "課税仕入 10%"
+            # 借方税区分
+            if tax_rate == "8":
+                debit_tax_class = "課税仕入 8%"
+            else:
+                debit_tax_class = "課税仕入 10%"
 
-        # 貸方勘定科目
-        if payment == "現金":
-            credit_account = "現金"
-        else:
-            credit_account = "未払金"
+            # 貸方勘定科目
+            if payment == "現金":
+                credit_account = "現金"
+            else:
+                credit_account = "未払金"
 
-        # 仕訳メモ
-        memo = f"カード：{card_name}" if card_name else ""
+            # 仕訳メモ
+            memo = f"カード：{card_name}" if card_name else ""
 
-        row = [
-            transaction_no,   # 取引No
-            date,             # 取引日
-            category,         # 借方勘定科目
-            "",               # 借方補助科目
-            "",               # 借方部門
-            "",               # 借方取引先
-            debit_tax_class,  # 借方税区分
-            "",               # 借方インボイス
-            amount,           # 借方金額(円)
-            0,                # 借方税額
-            credit_account,   # 貸方勘定科目
-            "",               # 貸方補助科目
-            "",               # 貸方部門
-            "",               # 貸方取引先
-            "対象外",         # 貸方税区分
-            "",               # 貸方インボイス
-            amount,           # 貸方金額(円)
-            0,                # 貸方税額
-            store,            # 摘要
-            memo,             # 仕訳メモ
-        ]
+            row = [
+                transaction_no,   # 取引No
+                date,             # 取引日
+                category,         # 借方勘定科目
+                "",               # 借方補助科目
+                "",               # 借方部門
+                "",               # 借方取引先
+                debit_tax_class,  # 借方税区分
+                "",               # 借方インボイス
+                amount,           # 借方金額(円)
+                0,                # 借方税額
+                credit_account,   # 貸方勘定科目
+                "",               # 貸方補助科目
+                "",               # 貸方部門
+                "",               # 貸方取引先
+                "対象外",         # 貸方税区分
+                "",               # 貸方インボイス
+                amount,           # 貸方金額(円)
+                0,                # 貸方税額
+                store,            # 摘要
+                memo,             # 仕訳メモ
+            ]
 
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        logger.info(f"MF仕訳シート書き込み完了: {store} ¥{amount}")
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            logger.info(f"MF仕訳シート書き込み完了: {store} ¥{amount}")
+            transaction_no += 1
+
         return True
     except Exception as e:
         logger.error(f"MF仕訳シート書き込みエラー: {e}")
@@ -473,20 +484,27 @@ def handle_image(event: MessageEvent):
         image_data = get_image_from_line(event.message.id)
 
         if mode == "receipt":
-            # レシートモード
-            receipt_info = extract_receipt_info(image_data)
-            if not receipt_info:
+            # レシートモード（複数枚対応）
+            receipt_list = extract_receipt_info(image_data)
+            if not receipt_list:
                 reply_text = "レシートの読み取りに失敗しました。もう一度お試しください。"
-            elif write_receipt_to_sheet(receipt_info):
-                amount = receipt_info.get("amount", "0")
-                reply_text = (
-                    f"✅ 記録しました\n"
-                    f"📅 {receipt_info.get('date', '')}\n"
-                    f"🏪 {receipt_info.get('store', '')}\n"
-                    f"💴 ¥{amount}（{receipt_info.get('tax_rate', '')}%）\n"
-                    f"💳 {receipt_info.get('payment', '')}\n"
-                    f"📂 {receipt_info.get('category', '')}"
-                )
+            elif write_receipts_to_sheet(receipt_list):
+                count = len(receipt_list)
+                reply_text = f"✅ {count}件記録しました\n"
+                for i, r in enumerate(receipt_list, 1):
+                    amount = r.get("amount", "0")
+                    if count > 1:
+                        reply_text += f"\n{i}件目\n"
+                    else:
+                        reply_text += "\n"
+                    reply_text += (
+                        f"📅 {r.get('date', '')}\n"
+                        f"🏪 {r.get('store', '')}\n"
+                        f"💴 ¥{amount}（{r.get('tax_rate', '')}%）\n"
+                        f"💳 {r.get('payment', '')}\n"
+                        f"📂 {r.get('category', '')}"
+                    )
+                reply_text += "\n\n📸 続けてレシートを送れます。終了する場合は『名刺』と送ってください。"
             else:
                 reply_text = "スプレッドシートへの書き込みに失敗しました。"
 
@@ -603,8 +621,8 @@ def handle_text(event: MessageEvent):
             )
         return
 
-    # モード切替：「名刺」
-    if text == "名刺":
+    # モード切替：「名刺」または「終了」
+    if text in ("名刺", "終了"):
         user_modes[user_id] = "meishi"
         reply_text = "📇 名刺モードに切り替えました。\n名刺の画像を送信してください。"
         with ApiClient(configuration) as api_client:
