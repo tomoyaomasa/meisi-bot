@@ -66,6 +66,13 @@ def get_gspread_client():
 
 
 # ========================================
+# セッション管理（ユーザーIDごとのモード管理）
+# ========================================
+
+user_modes: dict[str, str] = {}  # user_id -> "meishi" or "receipt"
+
+
+# ========================================
 # ユーティリティ関数
 # ========================================
 
@@ -210,6 +217,133 @@ def extract_card_info(image_data: bytes) -> Optional[list]:
         return None
 
 
+def extract_receipt_info(image_data: bytes) -> Optional[dict]:
+    """Claude Vision APIでレシート画像から情報を抽出する"""
+    base64_image = base64.b64encode(image_data).decode("utf-8")
+
+    prompt = """このレシート画像から情報を読み取り、以下のJSONのみを返してください。説明文は不要です。
+{
+  "date": "日付(YYYY/MM/DD形式)",
+  "store": "支払先名",
+  "amount": "税込金額(数値のみ)",
+  "tax_rate": "消費税率(8 or 10の数値のみ)",
+  "payment": "支払方法(現金/クレジット/ICカード のいずれか)",
+  "card_name": "カード会社名(クレジットの場合のみ、不明なら空)",
+  "category": "勘定科目(旅費交通費/会議費/消耗品費/車両費/通信費/接待交際費 のいずれかを推定)"
+}"""
+
+    try:
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": base64_image,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt,
+                        },
+                    ],
+                }
+            ],
+        )
+
+        result_text = response.content[0].text.strip()
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+        return json.loads(result_text)
+    except Exception as e:
+        logger.error(f"Claude API エラー（レシート）: {e}")
+        return None
+
+
+def write_receipt_to_sheet(receipt_info: dict) -> bool:
+    """レシート情報をMF仕訳シートに書き込む"""
+    try:
+        gc = get_gspread_client()
+        spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+
+        # MF仕訳シートを取得（なければ作成）
+        try:
+            ws = spreadsheet.worksheet("MF仕訳")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(title="MF仕訳", rows=1000, cols=20)
+            headers = [
+                "取引No", "取引日", "借方勘定科目", "借方補助科目", "借方部門",
+                "借方取引先", "借方税区分", "借方インボイス", "借方金額(円)", "借方税額",
+                "貸方勘定科目", "貸方補助科目", "貸方部門", "貸方取引先", "貸方税区分",
+                "貸方インボイス", "貸方金額(円)", "貸方税額", "摘要", "仕訳メモ",
+            ]
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+
+        # 取引No自動採番
+        all_values = ws.get_all_values()
+        transaction_no = len(all_values)  # ヘッダー行を含む行数 = 次の取引No
+
+        date = receipt_info.get("date", "")
+        category = receipt_info.get("category", "")
+        tax_rate = str(receipt_info.get("tax_rate", "10"))
+        amount = str(receipt_info.get("amount", "0"))
+        payment = receipt_info.get("payment", "")
+        store = receipt_info.get("store", "")
+        card_name = receipt_info.get("card_name", "")
+
+        # 借方税区分
+        if tax_rate == "8":
+            debit_tax_class = "課税仕入 8%"
+        else:
+            debit_tax_class = "課税仕入 10%"
+
+        # 貸方勘定科目
+        if payment == "現金":
+            credit_account = "現金"
+        else:
+            credit_account = "未払金"
+
+        # 仕訳メモ
+        memo = f"カード：{card_name}" if card_name else ""
+
+        row = [
+            transaction_no,   # 取引No
+            date,             # 取引日
+            category,         # 借方勘定科目
+            "",               # 借方補助科目
+            "",               # 借方部門
+            "",               # 借方取引先
+            debit_tax_class,  # 借方税区分
+            "",               # 借方インボイス
+            amount,           # 借方金額(円)
+            0,                # 借方税額
+            credit_account,   # 貸方勘定科目
+            "",               # 貸方補助科目
+            "",               # 貸方部門
+            "",               # 貸方取引先
+            "対象外",         # 貸方税区分
+            "",               # 貸方インボイス
+            amount,           # 貸方金額(円)
+            0,                # 貸方税額
+            store,            # 摘要
+            memo,             # 仕訳メモ
+        ]
+
+        ws.append_row(row, value_input_option="USER_ENTERED")
+        logger.info(f"MF仕訳シート書き込み完了: {store} ¥{amount}")
+        return True
+    except Exception as e:
+        logger.error(f"MF仕訳シート書き込みエラー: {e}")
+        return False
+
+
 def upsert_to_sheet(display_name: str, card_list: list) -> list:
     """Googleスプレッドシートにデータを追記または上書きする（複数枚対応）。
     各名刺について 'new' または 'updated' のステータスをリストで返す。"""
@@ -325,19 +459,48 @@ def callback():
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
-    """画像メッセージ処理"""
+    """画像メッセージ処理（モードに応じて名刺/レシートを分岐）"""
     user_id = event.source.user_id
     group_id = getattr(event.source, "group_id", None)
+    mode = user_modes.get(user_id, "meishi")
 
     # 送信者のdisplay_name取得
     display_name = get_display_name(user_id, group_id)
-    logger.info(f"画像受信: {display_name}")
+    logger.info(f"画像受信: {display_name} (mode={mode})")
 
     try:
         # 画像取得
         image_data = get_image_from_line(event.message.id)
 
-        # Claude Vision で名刺情報抽出
+        if mode == "receipt":
+            # レシートモード
+            receipt_info = extract_receipt_info(image_data)
+            if not receipt_info:
+                reply_text = "レシートの読み取りに失敗しました。もう一度お試しください。"
+            elif write_receipt_to_sheet(receipt_info):
+                amount = receipt_info.get("amount", "0")
+                reply_text = (
+                    f"✅ 記録しました\n"
+                    f"📅 {receipt_info.get('date', '')}\n"
+                    f"🏪 {receipt_info.get('store', '')}\n"
+                    f"💴 ¥{amount}（{receipt_info.get('tax_rate', '')}%）\n"
+                    f"💳 {receipt_info.get('payment', '')}\n"
+                    f"📂 {receipt_info.get('category', '')}"
+                )
+            else:
+                reply_text = "スプレッドシートへの書き込みに失敗しました。"
+
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)],
+                    )
+                )
+            return
+
+        # 名刺モード（デフォルト）
         card_list = extract_card_info(image_data)
         if not card_list:
             reply_text = "名刺の読み取りに失敗しました。もう一度お試しください。"
@@ -422,13 +585,42 @@ def handle_image(event: MessageEvent):
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_text(event: MessageEvent):
-    """テキストメッセージ処理（展示会名の一括設定）"""
+    """テキストメッセージ処理（モード切替・展示会名の一括設定）"""
     text = event.message.text.strip()
+    user_id = event.source.user_id
+
+    # モード切替：「レシート」
+    if text == "レシート":
+        user_modes[user_id] = "receipt"
+        reply_text = "🧾 レシートモードに切り替えました。\nレシートの画像を送信してください。"
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)],
+                )
+            )
+        return
+
+    # モード切替：「名刺」
+    if text == "名刺":
+        user_modes[user_id] = "meishi"
+        reply_text = "📇 名刺モードに切り替えました。\n名刺の画像を送信してください。"
+        with ApiClient(configuration) as api_client:
+            line_bot_api = MessagingApi(api_client)
+            line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)],
+                )
+            )
+        return
 
     # 「展示会：〇〇」または「展示会名：〇〇」のパターンを検出
     match = re.match(r'^展示会名?[：:](.+)$', text)
     if not match:
-        return  # 展示会コマンド以外は無視
+        return  # その他のテキストは無視
 
     exhibition_name = match.group(1).strip()
     if not exhibition_name:
